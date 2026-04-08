@@ -3,54 +3,70 @@ const cors = require('cors');
 const fetch = require('node-fetch');
 
 const app = express();
-app.use(cors());
-app.use(express.json());
-
 const PORT = process.env.PORT || 3000;
 
-// Proxy all Xero API requests
-app.use('/xero', async (req, res) => {
-  const xeroPath = req.path;
+app.use(cors({ origin: '*' }));
+app.use(express.json());
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', time: new Date().toISOString() });
+});
+
+// Keep-alive ping every 14 minutes so Render free tier never sleeps
+const RENDER_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+setInterval(() => {
+  fetch(`${RENDER_URL}/health`)
+    .then(() => console.log('Keep-alive ping OK'))
+    .catch(e => console.log('Keep-alive failed:', e.message));
+}, 14 * 60 * 1000);
+
+// Proxy /connections endpoint
+app.get('/connections', async (req, res) => {
+  const token = req.headers['authorization'];
+  if (!token) return res.status(401).json({ error: 'No authorization token' });
+  try {
+    const r = await fetch('https://api.xero.com/connections', {
+      headers: { 'Authorization': token, 'Content-Type': 'application/json' }
+    });
+    res.status(r.status).json(await r.json());
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Proxy all /xero/* to Xero API
+app.all('/xero/*', async (req, res) => {
   const token = req.headers['authorization'];
   const tenantId = req.headers['xero-tenant-id'];
-
   if (!token) return res.status(401).json({ error: 'No authorization token' });
 
+  const xeroPath = req.path.replace('/xero', '');
+  const qs = Object.keys(req.query).length ? '?' + new URLSearchParams(req.query).toString() : '';
+  const url = `https://api.xero.com${xeroPath}${qs}`;
+  console.log(`→ ${req.method} ${url}`);
+
   try {
-    const url = `https://api.xero.com${xeroPath}${req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : ''}`;
-    const response = await fetch(url, {
+    const r = await fetch(url, {
       method: req.method,
       headers: {
         'Authorization': token,
         'Content-Type': 'application/json',
         'Accept': 'application/json',
-        ...(tenantId && { 'xero-tenant-id': tenantId })
-      }
+        ...(tenantId ? { 'xero-tenant-id': tenantId } : {})
+      },
+      ...(req.method !== 'GET' && req.body ? { body: JSON.stringify(req.body) } : {})
     });
-
-    const data = await response.json();
-    res.status(response.status).json(data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+    const ct = r.headers.get('content-type') || '';
+    if (ct.includes('application/json')) {
+      res.status(r.status).json(await r.json());
+    } else {
+      const buf = await r.buffer();
+      res.status(r.status).set('Content-Type', ct).send(buf);
+    }
+  } catch (e) {
+    console.error('Error:', e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 
-// Proxy connections endpoint
-app.get('/connections', async (req, res) => {
-  const token = req.headers['authorization'];
-  if (!token) return res.status(401).json({ error: 'No authorization token' });
-
-  try {
-    const response = await fetch('https://api.xero.com/connections', {
-      headers: { 'Authorization': token, 'Content-Type': 'application/json' }
-    });
-    const data = await response.json();
-    res.status(response.status).json(data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
-
-app.listen(PORT, () => console.log(`Xero proxy running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Proxy running on ${PORT}`));
